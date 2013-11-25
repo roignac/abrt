@@ -113,8 +113,29 @@ static const char *const s_koops_suspicious_strings[] = {
      * arch/x86/kernel/cpu/mcheck/p5.c:		"CPU#%d: Machine Check Exception:  0x%8X (type 0x%8X).\n",
      * arch/x86/kernel/cpu/mcheck/mce.c:	pr_emerg(HW_ERR "CPU %d: Machine Check Exception: %Lx Bank %d: %016Lx\n",
      * drivers/edac/sb_edac.c:			printk("CPU %d: Machine Check Exception: %Lx Bank %d: %016Lx\n",
+     *
+     * MCEs can be fatal (they panic kernel) or not.
+     * Fatal MCE are delivered as exception#18 to the CPU.
+     * Non-fatal ones sometimes are delivered as exception#18;
+     * other times they are silently recorded in magic MSRs, CPU is not alerted.
+     * Linux kernel periodically (up to 5 mins interval) reads those MSRs
+     * and if MCE is seen there, it is piped in binary form through
+     * /dev/mcelog to whoever listens on it. (Such as mcelog tool in --daemon
+     * mode; but cat </dev/mcelog would do too).
+     *
+     * "Machine Check Exception:" message is printed *only*
+     * by fatal MCEs (so far, future kernels may be different).
+     * It will be caught as vmcore if kdump is configured.
+     *
+     * Non-fatal MCEs have "[Hardware Error]: Machine check events logged"
+     * message in kernel log.
+     * When /dev/mcelog is read, *no additional kernel log messages appear*:
+     * if we want more readable data, we must rely on other tools
+     * (such as mcelog daemon consuming binary /dev/mcelog and writing
+     * human-readable /var/log/mcelog).
      */
     "Machine Check Exception:",
+    "Machine check events logged",
 
     /* X86 TRAPs */
     "divide error:",
@@ -295,6 +316,16 @@ next_line:
         if (oopsstart >= 0 && !inbacktrace)
         {
             if (strcasestr(curline, "Call Trace:")) /* yes, it must be case-insensitive */
+                inbacktrace = 1;
+            else
+            /* Fatal MCE's have a few lines of useful information between
+             * first "Machine check exception:" line and the final "Kernel panic"
+             * line. Such oops, of course, is only detectable in kdumps (tested)
+             * or possibly pstore-saved logs (I did not try this yet).
+             * In order to capture all these lines, we treat final line
+             * as "backtrace" (which is admittedly a hack):
+             */
+            if (strstr(curline, "Kernel panic - not syncing"))
                 inbacktrace = 1;
             else
             if (strnlen(curline, 9) > 8
@@ -523,6 +554,60 @@ int koops_hash_str(char hash_str[SHA1_RESULT_LEN*2 + 1], const char *oops_buf)
             while (oops_buf < p)
                 strbuf_append_char(kernel_bt, *oops_buf++);
         }
+        goto gen_hash;
+    }
+
+    /* If it's an one-line oops (such as MCE), hash the line */
+    const char *eol = strchrnul(oops_buf, '\n');
+    if (!eol[0] || !eol[1]) /* "line" or "line\n" */
+    {
+        strbuf_append_strf(kernel_bt, "%.*s", (int)(eol - oops_buf), oops_buf);
+        goto gen_hash;
+    }
+
+    /* Default hashing algorithm:
+     * drop all whitespace and control chars,
+     * hash all words between them, with lowercasing (thus "CPU" = "cpu"),
+     * and hash all words which are (hex) numbers as string "Z"
+     * (numbers usually have too much variability,
+     * and we prefer to exclude them from hashed string).
+     */
+    bool start_of_word = 1;
+    while (*oops_buf)
+    {
+        if ((unsigned char)(*oops_buf) <= ' ')
+        {
+            start_of_word = 1;
+            oops_buf++;
+            continue;
+        }
+        if (!start_of_word)
+        {
+            goto hash_one_char;
+        }
+        /* We are at word start. If the entire word looks like a hex number
+         * (with ot without 0x prefix), replace it with a single letter Z.
+         */
+        const char *cp = oops_buf;
+        if (cp[0] == '0' && cp[1] == 'x')
+            cp += 2;
+        if (isxdigit(*cp))
+        {
+            while (isxdigit(*cp))
+                cp++;
+            if ((unsigned char)(*cp) <= ' ')
+            {
+                /* The word is entirely a hex string */
+                strbuf_append_char(kernel_bt, 'Z');
+                oops_buf = cp;
+                continue;
+            }
+        }
+        /* The word isn't entirely a hex string */
+        start_of_word = 0;
+ hash_one_char:
+        strbuf_append_char(kernel_bt, tolower((unsigned char)*oops_buf));
+        oops_buf++;
     }
 
  gen_hash: ;
